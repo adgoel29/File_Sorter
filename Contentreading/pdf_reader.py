@@ -1,7 +1,7 @@
 import os
 from pypdf import PdfReader
 
-folder_path=r"C:\Users\aditya\Documents\aditya docs"
+folder_path=r"C:\Users\aditya\Desktop\filefolder"
 def get_pdf_files(folder_path):
     pdf_files = []
     for root, _, files in os.walk(folder_path):
@@ -30,7 +30,8 @@ def get_all_content(folder_path):
 
     return checklist
 
-final_dict=get_all_content(folder_path)
+# final_dict=get_all_content(folder_path)
 
-print(final_dict)
+
+# print(final_dict)
 

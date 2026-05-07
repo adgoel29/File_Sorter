@@ -5,36 +5,221 @@ import numpy as np
 import hdbscan
 from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_distances
+import os
 
-model = SentenceTransformer('all-mpnet-base-v2') 
-folder_path=r"C:\Users\aditya\Desktop\filefolder"
+model = SentenceTransformer('allenai-specter')
+folder_path = r"C:\Users\aditya\Desktop\filefolder"
+file_texts = get_all_content_txt(folder_path)
 
-file_texts=get_all_content_txt(folder_path)
-file_names = list(file_texts.items())  # [("file1.pdf", "text..."), ...]
+if len(file_texts) == 0:
+    raise ValueError("No files were read. Check your folder path and reader functions.")
 
-texts = [text for _, text in file_names]
-names = [name for name, _ in file_names]
+print(f"Files loaded: {len(file_texts)}")
+for name, text in file_texts.items():
+    print(f"  {name}: {len(text)} chars | preview: {text[:80]}")
+
+
+def chunk_text(text, chunk_size=200, overlap=50):
+    words = text.split()
+    chunks = []
+
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = words[i:i + chunk_size]
+        if len(chunk) < 10:
+            continue
+        chunks.append(" ".join(chunk))
+
+    return chunks
+
+chunk_texts = []
+chunk_to_doc = []
 
 for name, text in file_texts.items():
-    print(f"{name}: {len(text)} chars | preview: {text[:80]}")
+    chunks = chunk_text(text)
 
-embeddings = model.encode(texts, show_progress_bar=True)
-distance_matrix = cosine_distances(embeddings).astype('float64')
+    if len(chunks) == 0:
+        chunks = [text] if text.strip() else []
+
+    for chunk in chunks:
+        chunk_texts.append(chunk)
+        chunk_to_doc.append(name)
+
+print(f"\nTotal chunks: {len(chunk_texts)}")
+print(f"\nTotal chunks: {chunk_to_doc}")
+
+if len(chunk_texts) == 0:
+    raise ValueError("No chunks created. Your files may be empty or unreadable.")
+
+
+embeddings = model.encode(chunk_texts, show_progress_bar=True)
+embeddings = embeddings.astype(np.float64)
+
+print(f"Embeddings shape: {embeddings.shape}")
+
+
+distance_matrix = cosine_distances(embeddings)
+distance_matrix = distance_matrix.astype(np.float64)
+distance_matrix = (distance_matrix + distance_matrix.T) / 2
+np.fill_diagonal(distance_matrix, 0)
+
+# -----------------------------
+# 7. Noise diagnostics
+# -----------------------------
+# Tune min_cluster_size based on total chunks:
+# ~50 chunks  -> min_cluster_size=5,  min_samples=2
+# ~100 chunks -> min_cluster_size=8,  min_samples=3
+# ~200 chunks -> min_cluster_size=12, min_samples=4
 
 clusterer = hdbscan.HDBSCAN(
     min_cluster_size=2,
-    min_samples=1,
+    min_samples=2,
     metric='precomputed'
 )
+
 labels = clusterer.fit_predict(distance_matrix)
-clusters = defaultdict(list)
+print(f"the predicted labels are:{labels}")
+noise_count = sum(1 for l in labels if l == -1)
+print(f"\nNoise chunks: {noise_count} / {len(labels)}")
+print(f"Unique clusters found: {len(set(labels)) - (1 if -1 in labels else 0)}")
 
-for name, label in zip(names, labels):
-    clusters[label].append(name)
 
-for label, files in clusters.items():
-    cluster_name = "NOISE / Uncategorised" if label == -1 else f"Cluster {label}"
-    print(f"\n{cluster_name}:")
-    for f in files:
-        print(f"  - {f}")
-# embeddings.shape → (num_files, 384)  ← 384-dim vector per file
+from collections import defaultdict
+
+# -----------------------------------
+# STEP 1: Count clusters per document
+# -----------------------------------
+
+# Structure:
+# {
+#   "doc1.txt": {0: 120, 1: 50},
+#   "doc2.txt": {2: 200}
+# }
+doc_cluster_count = {}
+
+for i in range(len(labels)):
+    label = labels[i]
+
+    # Ignore noise chunks (cluster = -1)
+    if label == -1:
+        continue
+
+    doc = chunk_to_doc[i]  # which document this chunk belongs to
+
+    # Weight = number of words in chunk
+    weight = len(chunk_texts[i].split())
+
+    # If document not seen before → create empty dict
+    if doc not in doc_cluster_count:
+        doc_cluster_count[doc] = {}
+
+    # If cluster not seen for this doc → initialize to 0
+    if label not in doc_cluster_count[doc]:
+        doc_cluster_count[doc][label] = 0
+
+    # Add weight to that cluster
+    doc_cluster_count[doc][label] += weight
+    
+    
+
+
+print("Doc → Cluster Weights:")
+print(doc_cluster_count)
+
+
+# -----------------------------------
+# STEP 2: Decide final cluster per doc
+# -----------------------------------
+
+doc_final_cluster = {}
+
+for doc in doc_cluster_count:
+
+    cluster_counts = doc_cluster_count[doc]
+
+    # Total weight of all clusters
+    total = sum(cluster_counts.values())
+
+    # Find cluster with highest weight
+    best_cluster = max(cluster_counts, key=cluster_counts.get)
+
+    # Confidence = how dominant that cluster is
+    confidence = cluster_counts[best_cluster] / total
+
+    # If not dominant enough → mark as noise
+    if confidence < 0.4:
+        doc_final_cluster[doc] = -1
+    else:
+        doc_final_cluster[doc] = best_cluster
+
+print(doc_final_cluster)
+# -----------------------------------
+# STEP 3: Ensure all docs are included
+# -----------------------------------
+
+for doc in file_texts:
+    if doc not in doc_final_cluster:
+        doc_final_cluster[doc] = -1
+
+
+# -----------------------------------
+# STEP 4: Group documents by cluster
+# -----------------------------------
+
+# Structure:
+# {
+#   0: ["doc1", "doc5"],
+#   1: ["doc2"],
+#   -1: ["doc3"]
+# }
+final_clusters = {}
+
+for doc, cluster in doc_final_cluster.items():
+
+    if cluster not in final_clusters:
+        final_clusters[cluster] = []
+
+    final_clusters[cluster].append(doc)
+
+
+# -----------------------------------
+# STEP 5: Print results
+# -----------------------------------
+
+print("\n===== CLUSTERING RESULTS =====")
+
+for cluster, docs in final_clusters.items():
+
+    if cluster == -1:
+        print("\nNOISE / Uncategorised:")
+    else:
+        print(f"\nCluster {cluster}:")
+
+    for d in docs:
+        print("  -", d)
+
+print(final_clusters)
+toreturn={
+    key:[os.path.join(folder_path,filename) for filename in values]
+    for key,values in final_clusters.items()
+}
+
+        # toreturn[group]=os.path.join(folder_path,j)
+
+print(toreturn)
+
+# -----------------------------------
+# STEP 6: Debug confidence per doc
+# -----------------------------------
+
+print("\n===== DEBUG: Confidence =====")
+
+for doc in doc_cluster_count:
+
+    cluster_counts = doc_cluster_count[doc]
+    total = sum(cluster_counts.values())
+
+    print(f"\n{doc}:")
+
+    for cluster in cluster_counts:
+        ratio = cluster_counts[cluster] / total
+        print(f"  Cluster {cluster}: {ratio:.2f}")

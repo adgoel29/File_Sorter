@@ -21,6 +21,7 @@ def get_foldername(text):
 
     Give:
     1. strictly just give one or 2 word category name nothing else
+    nothing else
 
     Documents:
     {text} """)

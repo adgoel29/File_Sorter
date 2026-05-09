@@ -2,26 +2,12 @@ from sentence_transformers import SentenceTransformer
 from content_reader import get_all_content
 import numpy as np
 import hdbscan
-from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_distances
 import os
 
-# model = SentenceTransformer('allenai-specter')
-model = SentenceTransformer('all-MiniLM-L6-v2') 
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 
-def chunk_text(text, chunk_size=200, overlap=50):
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = words[i:i + chunk_size]
-        if len(chunk) < 10:
-            continue
-        chunks.append(" ".join(chunk))
-    return chunks
-
-
-# ✅ ADD THIS NEW FUNCTION HERE (before getans)
 def get_representative_chunks(cluster_id, labels, chunk_texts, embeddings, top_n=5):
     cluster_indices = [i for i, l in enumerate(labels) if l == cluster_id]
     if not cluster_indices:
@@ -35,8 +21,7 @@ def get_representative_chunks(cluster_id, labels, chunk_texts, embeddings, top_n
 
 def getans(folder_path):
 
-    file_texts = get_all_content(folder_path)
-    print(file_texts)
+    file_texts = get_all_content(folder_path)  # now returns {filename: [chunks]}
 
     if len(file_texts) == 0:
         raise ValueError("No files were read. Check your folder path and reader functions.")
@@ -44,10 +29,10 @@ def getans(folder_path):
     chunk_texts = []
     chunk_to_doc = []
 
-    for name, text in file_texts.items():
-        chunks = chunk_text(text)
-        if len(chunks) == 0:
-            chunks = [text] if text.strip() else []
+    # ✅ CHANGED: file_texts values are already lists of chunks, no chunk_text() call needed
+    for name, chunks in file_texts.items():
+        if not chunks:
+            continue
         for chunk in chunks:
             chunk_texts.append(chunk)
             chunk_to_doc.append(name)
@@ -96,6 +81,7 @@ def getans(folder_path):
         else:
             doc_final_cluster[doc] = best_cluster
 
+    # ✅ CHANGED: iterate file_texts keys (not file_texts itself, same thing but explicit)
     for doc in file_texts:
         if doc not in doc_final_cluster:
             doc_final_cluster[doc] = -1
@@ -106,22 +92,17 @@ def getans(folder_path):
             final_clusters[cluster] = []
         final_clusters[cluster].append(doc)
 
-    # ✅ ADD THIS BLOCK HERE — builds the LLM input for each cluster
     cluster_representative_text = {}
     for cluster_id in final_clusters:
         if cluster_id == -1:
-            continue  # skip noise
+            continue
 
-        # get the 5 most central chunks for this cluster
         rep_chunks = get_representative_chunks(
             cluster_id, labels, chunk_texts, embeddings, top_n=5
         )
 
-        # get the filenames in this cluster
         doc_names = final_clusters[cluster_id]
         doc_list = "\n".join(f"- {d}" for d in doc_names)
-
-        # trim each chunk to 300 chars so LLM input stays small
         chunk_list = "\n\n".join(
             f"[Excerpt {i+1}]: {c[:300]}" for i, c in enumerate(rep_chunks)
         )
@@ -130,39 +111,18 @@ def getans(folder_path):
             f"Files in group:\n{doc_list}\n\nRepresentative excerpts:\n{chunk_list}"
         )
 
-    # toreturn = {
-    #     str(key): [filename for filename in values]
-    #     for key, values in final_clusters.items()
-    # }
-    toreturn={}
-    # replace your current toreturn and return at the bottom with this:
-    
+    toreturn = {}
     for cluster_id, docs in final_clusters.items():
-        
         rep_text = cluster_representative_text.get(cluster_id, "")
-        
         toreturn[str(cluster_id)] = {
             "files": docs,
-            "llm_input": rep_text if cluster_id!=-1 else "other"  # ready to paste into mychain.invoke
+            "llm_input": rep_text if cluster_id != -1 else "other"
         }
 
     return toreturn
 
-    # ✅ NOW you can pass cluster_representative_text to your LLM naming function
-    # e.g. for cluster_id, text in cluster_representative_text.items():
-    #          name = mychain.invoke({"topic": text})
-    #          print(cluster_id, "→", name)
-
-    # return toreturn, cluster_representative_text  # return both
-
 
 if __name__ == "__main__":
-    folder_path = r"C:\Users\aditya\Desktop\filefolder"
-    ans= getans(folder_path)
+    folder_path = r"C:\Users\aditya\Desktop\my"
+    ans = getans(folder_path)
     print(f"the answer is: {ans}")
-   
-
-    # plug into your langchain naming code:
-    # for cluster_id, text in cluster_texts.items():
-    #     name = mychain.invoke({"topic": text})
-    #     print(f"Cluster {cluster_id} → {name}")

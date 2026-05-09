@@ -8,7 +8,8 @@ import json
 import re
 
 chat= ChatOllama(
-    model="gemma3:1b"
+    model="gemma3:1b",
+    temperature=0
 )
 
 
@@ -20,7 +21,6 @@ def get_foldername(text):
 
     Give:
     1. strictly just give one or 2 word category name nothing else
-    
 
     Documents:
     {text} """)

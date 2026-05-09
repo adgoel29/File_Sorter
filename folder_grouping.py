@@ -15,7 +15,3 @@ for i,j in ans.items():
         oldpath=os.path.join(folder_path,z)
         newpath=os.path.join(clusterpath,z)
         shutil.move(oldpath,newpath)
-    # print(f"the cluster is {i}")
-    # print(f"the files are {j}")
-    # print("/n")
-

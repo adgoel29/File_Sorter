@@ -1,13 +1,13 @@
 from sentence_transformers import SentenceTransformer
-from Contentreading.pdf_reader import get_all_content
-from Contentreading.txtreader import get_all_content_txt
+from content_reader import get_all_content
 import numpy as np
 import hdbscan
 from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_distances
 import os
 
-model = SentenceTransformer('allenai-specter')
+# model = SentenceTransformer('allenai-specter')
+model = SentenceTransformer('all-MiniLM-L6-v2') 
 
 
 def chunk_text(text, chunk_size=200, overlap=50):
@@ -35,7 +35,8 @@ def get_representative_chunks(cluster_id, labels, chunk_texts, embeddings, top_n
 
 def getans(folder_path):
 
-    file_texts = get_all_content_txt(folder_path)
+    file_texts = get_all_content(folder_path)
+    print(file_texts)
 
     if len(file_texts) == 0:
         raise ValueError("No files were read. Check your folder path and reader functions.")
@@ -65,7 +66,7 @@ def getans(folder_path):
     np.fill_diagonal(distance_matrix, 0)
 
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=2,
+        min_cluster_size=3,
         min_samples=2,
         metric='precomputed'
     )

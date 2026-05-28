@@ -2,6 +2,7 @@ from sentence_transformers import SentenceTransformer
 from content_reader import get_all_content
 import numpy as np
 import hdbscan
+import umap
 from sklearn.metrics.pairwise import cosine_distances
 import os
 import hashlib
@@ -27,15 +28,42 @@ def save_cache(cache):
         pickle.dump(cache, f)
 
 
-def get_representative_chunks(cluster_id, labels, chunk_texts, embeddings, top_n=5):
-    indices = [i for i, l in enumerate(labels) if l == cluster_id]
-    if not indices:
-        return []
-    cluster_embs = embeddings[indices]
-    centroid = cluster_embs.mean(axis=0, keepdims=True)
-    distances = cosine_distances(centroid, cluster_embs)[0]
-    top = np.argsort(distances)[:top_n]
-    return [chunk_texts[indices[i]] for i in top]
+def weighted_average_embedding(chunks, embeddings):
+    """Weighted average: longer chunks contribute more (by word count)."""
+    weights = np.array([len(c.split()) for c in chunks], dtype=np.float64)
+    total = weights.sum()
+    if total == 0:
+        return embeddings.mean(axis=0)
+    return (embeddings * weights[:, None]).sum(axis=0) / total
+
+
+def get_umap_params(n_docs):
+    if n_docs < 5:
+        return None
+    elif n_docs <= 20:
+        return dict(n_neighbors=min(3, n_docs - 1), min_dist=0.02, n_components=2)
+        # return None
+    elif n_docs <= 200:
+        return dict(n_neighbors=min(15, n_docs - 1), min_dist=0.05, n_components=2)
+    else:
+        return dict(n_neighbors=min(30, n_docs - 1), min_dist=0.0, n_components=2)
+
+
+def get_hdbscan_params(n_docs):
+    if n_docs <= 100:
+        return dict(min_cluster_size=2, min_samples=1)
+    else:
+        size = max(5, int(np.sqrt(n_docs)))
+        return dict(min_cluster_size=size, min_samples=2)
+
+
+def build_cosine_distance_matrix(embeddings):
+    """Symmetric, zero-diagonal cosine distance matrix for HDBSCAN precomputed."""
+    dist = cosine_distances(embeddings).astype(np.float64)
+    dist = (dist + dist.T) / 2          # enforce perfect symmetry
+    np.fill_diagonal(dist, 0.0)
+    np.clip(dist, 0.0, None, out=dist)  # kill any tiny negatives from float errors
+    return dist
 
 
 def getans(folder_path):
@@ -46,89 +74,96 @@ def getans(folder_path):
 
     cache = load_cache()
 
-    chunk_texts = []
-    chunk_to_doc = []
-    all_embeddings = []
+    # ── 1. Chunking + Sentence Embeddings (cached per file) ──────────────────
+    doc_names = []
+    doc_avg_embeddings = []
+    doc_rep_chunks = {}
 
     for name, chunks in file_texts.items():
         if not chunks:
+            print(f"[skip] {name} — no chunks")
             continue
 
         file_hash = get_hash(chunks)
 
-        # cache hit — reuse stored embeddings
         if name in cache and cache[name]["hash"] == file_hash:
             embs = cache[name]["embeddings"]
             print(f"[cache hit]  {name}")
-
-        # cache miss — encode and store
         else:
             print(f"[cache miss] {name}")
-            embs = model.encode(chunks, show_progress_bar=True).astype(np.float64)
+            embs = model.encode(chunks, show_progress_bar=False).astype(np.float64)
             cache[name] = {"hash": file_hash, "chunks": chunks, "embeddings": embs}
 
-        for chunk, emb in zip(chunks, embs):
-            chunk_texts.append(chunk)
-            chunk_to_doc.append(name)
-            all_embeddings.append(emb)
+        # ── 2. Weighted average embedding per document ────────────────────
+        avg_emb = weighted_average_embedding(chunks, embs)
+
+        doc_names.append(name)
+        doc_avg_embeddings.append(avg_emb)
+        doc_rep_chunks[name] = chunks
 
     save_cache(cache)
 
-    if not chunk_texts:
-        raise ValueError("No chunks created.")
+    if not doc_names:
+        raise ValueError("No documents with chunks found.")
 
-    embeddings = np.array(all_embeddings)
+    n_docs = len(doc_names)
+    doc_matrix = np.array(doc_avg_embeddings)  # shape: (n_docs, emb_dim)
 
-    distance_matrix = cosine_distances(embeddings).astype(np.float64)
-    distance_matrix = (distance_matrix + distance_matrix.T) / 2
-    np.fill_diagonal(distance_matrix, 0)
+    # ── 3. UMAP (dimensionality reduction only — for structure, not clustering) 
+    umap_params = get_umap_params(n_docs)
+
+    if umap_params is None:
+        print(f"[umap] skipped (only {n_docs} docs)")
+    else:
+        print(f"[umap] reducing {n_docs} docs with params {umap_params}")
+        reducer = umap.UMAP(**umap_params, metric="cosine", random_state=42)
+        umap_output = reducer.fit_transform(doc_matrix)  # shape: (n_docs, 2)
+        doc_matrix = umap_output
+
+    # #     # Lift UMAP output back to unit vectors so cosine distance is meaningful.
+    # #     # Normalize each 2D point onto the unit circle before distance computation.
+        norms = np.linalg.norm(umap_output, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        doc_matrix = umap_output / norms  # replace doc_matrix with normalized UMAP coords
+
+    # ── 4. Precomputed cosine distance matrix ─────────────────────────────────
+    print("[hdbscan] building cosine distance matrix...")
+    dist_matrix = build_cosine_distance_matrix(doc_matrix)
+
+    # ── 5. HDBSCAN with precomputed metric ────────────────────────────────────
+    hdb_params = get_hdbscan_params(n_docs)
+    print(f"[hdbscan] params {hdb_params} | metric=precomputed (cosine)")
 
     labels = hdbscan.HDBSCAN(
-        min_cluster_size=3,
-        min_samples=2,
-        metric='precomputed'
-    ).fit_predict(distance_matrix)
+        **hdb_params,
+        metric="precomputed"
+    ).fit_predict(dist_matrix)
 
-    # vote: each chunk votes for its cluster, weighted by word count
-    doc_cluster_count = {}
-    for i, label in enumerate(labels):
-        if label == -1:
-            continue
-        doc = chunk_to_doc[i]
-        weight = len(chunk_texts[i].split())
-        doc_cluster_count.setdefault(doc, {})
-        doc_cluster_count[doc][label] = doc_cluster_count[doc].get(label, 0) + weight
+    print(f"[hdbscan] labels: {dict(zip(*np.unique(labels, return_counts=True)))}")
 
-    # assign each doc to its winning cluster
-    doc_final_cluster = {}
-    for doc, counts in doc_cluster_count.items():
-        total = sum(counts.values())
-        best = max(counts, key=counts.get)
-        doc_final_cluster[doc] = best if counts[best] / total >= 0.4 else -1
-
-    # any doc with no chunks in any cluster → noise
-    for doc in file_texts:
-        if doc not in doc_final_cluster:
-            doc_final_cluster[doc] = -1
-
-    # group docs by cluster
+    # ── 6. Build output clusters ──────────────────────────────────────────────
     final_clusters = {}
-    for doc, cluster in doc_final_cluster.items():
-        final_clusters.setdefault(cluster, []).append(doc)
+    for doc, label in zip(doc_names, labels):
+        final_clusters.setdefault(int(label), []).append(doc)
 
-    # build llm_input per cluster
+    # ── 7. Pick representative excerpts per cluster ───────────────────────────
+    def pick_excerpts(docs, top_n=5):
+        all_chunks = []
+        for d in docs:
+            all_chunks.extend(doc_rep_chunks.get(d, []))
+        all_chunks.sort(key=lambda c: len(c.split()), reverse=True)
+        return all_chunks[:top_n]
+
     toreturn = {}
     for cluster_id, docs in final_clusters.items():
         if cluster_id == -1:
             toreturn["-1"] = {"files": docs, "llm_input": "other"}
             continue
 
-        rep_chunks = get_representative_chunks(
-            cluster_id, labels, chunk_texts, embeddings, top_n=5
-        )
+        excerpts = pick_excerpts(docs)
         doc_list = "\n".join(f"- {d}" for d in docs)
         chunk_list = "\n\n".join(
-            f"[Excerpt {i+1}]: {c[:300]}" for i, c in enumerate(rep_chunks)
+            f"[Excerpt {i+1}]: {c[:300]}" for i, c in enumerate(excerpts)
         )
         toreturn[str(cluster_id)] = {
             "files": docs,

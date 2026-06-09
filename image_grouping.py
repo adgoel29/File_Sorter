@@ -9,6 +9,15 @@ from sklearn.preprocessing import normalize
 import umap
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from itertools import product
+from concurrent.futures import ThreadPoolExecutor
+
+
+# ── Image loading helper (parallelisable) ──────────────────────
+def _load_image(path):
+    try:
+        return path, Image.open(path).convert("RGB")
+    except Exception as e:
+        return path, e
 
 
 def get_image_clusters(
@@ -21,6 +30,7 @@ def get_image_clusters(
     clip_weight      = 0.5,
     blip_weight      = 0.5,
     dedup_threshold  = 0.02,
+    batch_size       = 8,           # tune up/down based on your RAM
 ):
     """
     Clusters images and returns a dict keyed by cluster label (str), each containing:
@@ -28,7 +38,15 @@ def get_image_clusters(
       - "llm_input" : formatted string of filename + BLIP caption pairs (for LLM naming)
 
     Noise cluster is returned under key "-1" with llm_input="other".
-    Mirrors the structure returned by getans().
+
+    iGPU optimisations applied:
+      • Batch processing for CLIP + BLIP  (biggest speedup)
+      • torch.inference_mode()            (faster than no_grad)
+      • float16 when CUDA available       (halves memory bandwidth)
+      • Parallel image loading            (hides I/O latency)
+      • Cache written once per batch      (not per image)
+      • UMAP low_memory=True              (less RAM pressure)
+      • Dedup via numpy, not Python loops
     """
 
     assert abs(clip_weight + blip_weight - 1.0) < 1e-6, \
@@ -92,17 +110,19 @@ def get_image_clusters(
     needs_clip = len(missing_visual_emb) > 0 or len(missing_text_emb) > 0
     needs_blip = len(missing_captions) > 0
 
+    # ── Device + dtype ─────────────────────────────────────────
+    device = "cuda" if (torch.cuda.is_available() and (needs_clip or needs_blip)) else "cpu"
+    # float16 on CUDA cuts memory bandwidth ~2x; CPU stays float32 (no benefit there)
+    dtype  = torch.float16 if device == "cuda" else torch.float32
+    print(f"Device: {device.upper()}  |  dtype: {dtype}")
+
     # ── Load models ────────────────────────────────────────────
     clip_model, clip_processor = None, None
     blip_model, blip_processor = None, None
-    device = "cpu"
-
-    if needs_clip or needs_blip:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if needs_clip:
         print("Loading CLIP...")
-        clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device, dtype)
         clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
         clip_model.eval()
     else:
@@ -111,83 +131,137 @@ def get_image_clusters(
     if needs_blip:
         print("Loading BLIP...")
         blip_model     = BlipForConditionalGeneration.from_pretrained(
-                             "Salesforce/blip-image-captioning-base").to(device)
+                             "Salesforce/blip-image-captioning-base").to(device, dtype)
         blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
         blip_model.eval()
     else:
         print("All captions cached — skipping BLIP load")
 
     def get_clip():
-        nonlocal clip_model, clip_processor, device
+        nonlocal clip_model, clip_processor
         if clip_model is None:
-            device         = "cuda" if torch.cuda.is_available() else "cpu"
             print("Loading CLIP for text embeddings...")
-            clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+            clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device, dtype)
             clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
             clip_model.eval()
         return clip_model, clip_processor
 
-    # ── Embed ──────────────────────────────────────────────────
+    # ── Helper: safely extract tensor ─────────────────────────
+    def extract_tensor(output):
+        if isinstance(output, torch.Tensor):
+            return output
+        for attr in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
+            if hasattr(output, attr):
+                val = getattr(output, attr)
+                if val is not None:
+                    return val
+        if hasattr(output, "__getitem__"):
+            return output[0]
+        raise TypeError(f"Cannot extract tensor from output of type {type(output)}")
+
+    # ── Pre-load all images in parallel ───────────────────────
+    print(f"\nPre-loading {len(image_paths)} images in parallel...")
+    loaded_images = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for path, result in pool.map(_load_image, image_paths):
+            if isinstance(result, Exception):
+                print(f"  [load error] {path.name}: {result}")
+            else:
+                loaded_images[path.name] = result
+
+    # ── Batch helpers ──────────────────────────────────────────
+    def chunked(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i : i + n]
+
+    # ── Pass 1: visual embeddings (batch CLIP) ─────────────────
+    paths_needing_visual = [p for p in image_paths if p.name in loaded_images
+                            and p.name not in embedding_cache]
+    if paths_needing_visual:
+        cm, cp = get_clip()
+        print(f"\nComputing visual embeddings for {len(paths_needing_visual)} images "
+              f"(batch={batch_size})...")
+        for batch in chunked(paths_needing_visual, batch_size):
+            imgs = [loaded_images[p.name] for p in batch]
+            inp  = cp(images=imgs, return_tensors="pt").to(device)
+            with torch.inference_mode():
+                out  = cm.get_image_features(**inp)
+                feat = extract_tensor(out).float()          # back to fp32 for numpy
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+            for i, p in enumerate(batch):
+                embedding_cache[p.name] = feat[i].cpu().numpy().tolist()
+                print(f"  [visual] {p.name}")
+        EMBEDDING_CACHE.write_text(json.dumps(embedding_cache))
+
+    # ── Pass 2: captions (batch BLIP) ─────────────────────────
+    paths_needing_captions = [p for p in image_paths if p.name in loaded_images
+                              and p.name not in caption_cache]
+    if paths_needing_captions:
+        print(f"\nGenerating captions for {len(paths_needing_captions)} images "
+              f"(batch={batch_size})...")
+        for batch in chunked(paths_needing_captions, batch_size):
+            imgs = [loaded_images[p.name] for p in batch]
+            inp  = blip_processor(imgs, return_tensors="pt", padding=True).to(device)
+            # BLIP generate needs fp32 inputs regardless of model dtype
+            inp  = {k: v.float() if v.dtype in (torch.float16, torch.bfloat16) else v
+                    for k, v in inp.items()}
+            with torch.inference_mode():
+                out = blip_model.generate(**inp, max_new_tokens=30)
+            for i, p in enumerate(batch):
+                caption = blip_processor.decode(out[i], skip_special_tokens=True)
+                caption_cache[p.name] = caption
+                print(f"  [caption] {p.name} → \"{caption}\"")
+        CAPTION_CACHE.write_text(json.dumps(caption_cache, indent=2))
+
+    # ── Pass 3: text embeddings (batch CLIP) ──────────────────
+    paths_needing_text = [p for p in image_paths if p.name in caption_cache
+                          and p.name not in text_embedding_cache]
+    if paths_needing_text:
+        cm, cp = get_clip()
+        print(f"\nComputing text embeddings for {len(paths_needing_text)} images "
+              f"(batch={batch_size})...")
+        for batch in chunked(paths_needing_text, batch_size):
+            captions = [caption_cache[p.name] for p in batch]
+            inp      = cp(text=captions, return_tensors="pt",
+                          padding=True, truncation=True).to(device)
+            with torch.inference_mode():
+                out  = cm.get_text_features(**inp)
+                feat = extract_tensor(out).float()
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+            for i, p in enumerate(batch):
+                text_embedding_cache[p.name] = feat[i].cpu().numpy().tolist()
+                print(f"  [text] {p.name}")
+        TEXT_EMBEDDING_CACHE.write_text(json.dumps(text_embedding_cache))
+
+    # ── Fuse embeddings ────────────────────────────────────────
     embeddings, valid_paths = [], []
-
-    print(f"Processing {len(image_paths)} images...")
+    print(f"\nFusing embeddings for {len(image_paths)} images...")
     for path in image_paths:
+        key = path.name
+        if key not in embedding_cache or key not in text_embedding_cache:
+            print(f"  Skipping {key}: missing embedding or text embedding")
+            continue
         try:
-            key = path.name
-
-            if key in embedding_cache:
-                clip_feat_np = np.array(embedding_cache[key], dtype=np.float32)
-            else:
-                img      = Image.open(path).convert("RGB")
-                cm, cp   = get_clip()
-                clip_inp = cp(images=img, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    clip_feat = cm.get_image_features(**clip_inp)
-                    clip_feat = clip_feat / clip_feat.norm(dim=-1, keepdim=True)
-                clip_feat_np = clip_feat.squeeze().cpu().numpy()
-                embedding_cache[key] = clip_feat_np.tolist()
-                EMBEDDING_CACHE.write_text(json.dumps(embedding_cache))
-                print(f"  [new visual]  {key}")
-
-            if key in caption_cache:
-                caption = caption_cache[key]
-            else:
-                img = Image.open(path).convert("RGB")
-                inp = blip_processor(img, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    out = blip_model.generate(**inp, max_new_tokens=30)
-                caption = blip_processor.decode(out[0], skip_special_tokens=True)
-                caption_cache[key] = caption
-                CAPTION_CACHE.write_text(json.dumps(caption_cache, indent=2))
-                print(f"  [new caption] {key} → \"{caption}\"")
-
-            if key in text_embedding_cache:
-                txt_feat_np = np.array(text_embedding_cache[key], dtype=np.float32)
-            else:
-                cm, cp  = get_clip()
-                txt_inp = cp(text=caption, return_tensors="pt",
-                             padding=True, truncation=True).to(device)
-                with torch.no_grad():
-                    txt_feat = cm.get_text_features(**txt_inp)
-                    txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
-                txt_feat_np = txt_feat.squeeze().cpu().numpy()
-                text_embedding_cache[key] = txt_feat_np.tolist()
-                TEXT_EMBEDDING_CACHE.write_text(json.dumps(text_embedding_cache))
-                print(f"  [new text]    {key}")
-
+            clip_feat_np = np.array(embedding_cache[key],      dtype=np.float32)
+            txt_feat_np  = np.array(text_embedding_cache[key], dtype=np.float32)
             fused = clip_weight * clip_feat_np + blip_weight * txt_feat_np
             fused = fused / np.linalg.norm(fused)
             embeddings.append(fused)
             valid_paths.append(path)
-
         except Exception as e:
-            print(f"  Skipping {path.name}: {e}")
+            print(f"  Skipping {key}: {e}")
+
+    if len(embeddings) == 0:
+        raise RuntimeError(
+            "No images were successfully embedded. "
+            "Check the 'Skipping' errors above for the root cause."
+        )
 
     embeddings = normalize(np.array(embeddings))
     n          = len(embeddings)
     print(f"\nEmbedded {n} images  (CLIP×{clip_weight} + BLIP×{blip_weight})")
 
-    # ── Deduplicate ────────────────────────────────────────────
+    # ── Deduplicate (numpy, no Python loops) ───────────────────
     sim_full = cosine_similarity(embeddings).astype(np.float64)
     np.fill_diagonal(sim_full, -1)
 
@@ -196,8 +270,9 @@ def get_image_clusters(
         if i in seen:
             continue
         keep_idx.append(i)
-        for j in range(i + 1, n):
-            if j not in seen and (1.0 - sim_full[i, j]) < dedup_threshold:
+        dups = np.where((1.0 - sim_full[i]) < dedup_threshold)[0]
+        for j in dups:
+            if j > i and j not in seen:
                 seen.add(j)
                 dup_map[j] = i
 
@@ -214,7 +289,6 @@ def get_image_clusters(
 
     mcs_values   = sorted(set(scale_mcs(f, n_uniq) for f in cfg["mcs_fractions"]))
     n_neighbors  = min(cfg["umap_neighbors"], n_uniq - 1)
-    # n_components = min(10, n_uniq - 1)
     n_components = min(10, max(2, n_uniq // 2))
 
     print(f"\n{'═'*57}")
@@ -236,7 +310,7 @@ def get_image_clusters(
     print(f"Before UMAP (sample={len(s_idx)}): "
           f"mean_sim={s_sim.mean():.3f}  p90={np.percentile(s_sim, 90):.3f}")
 
-    # ── UMAP ───────────────────────────────────────────────────
+    # ── UMAP (low_memory saves RAM on iGPU shared memory) ─────
     print(f"\nRunning UMAP (n_neighbors={n_neighbors}, "
           f"min_dist={cfg['umap_min_dist']}, n_components={n_components})...")
 
@@ -246,6 +320,7 @@ def get_image_clusters(
         min_dist     = cfg["umap_min_dist"],
         metric       = "cosine",
         random_state = 42,
+        low_memory   = True,        # ← iGPU optimisation: less RAM pressure
     ).fit_transform(uniq_emb)
 
     print(f"UMAP done → {reduced.shape[1]}D")
@@ -300,6 +375,7 @@ def get_image_clusters(
                     cluster_selection_method  = method,
                     cluster_selection_epsilon = 0.0,
                     prediction_data           = False,
+                    core_dist_n_jobs          = -1,   # use all CPU cores
                 )
                 lbs     = c.fit_predict(reduced)
                 s       = score(lbs, n_uniq,
@@ -381,19 +457,22 @@ def get_image_clusters(
     print(f"  Total clusters : {len(set(all_labels) - {-1})}")
     print(f"  Noise remaining: {final_noise} ({final_noise/n*100:.1f}%)")
 
-    # ── Top similar pairs audit ────────────────────────────────
-    sim_audit = cosine_similarity(uniq_emb)
+    # ── Top similar pairs audit (capped for speed) ─────────────
+    audit_n   = min(500, n_uniq)
+    audit_idx = np.random.choice(n_uniq, audit_n, replace=False)
+    sim_audit = cosine_similarity(uniq_emb[audit_idx])
     np.fill_diagonal(sim_audit, -1)
+    audit_paths = [uniq_paths[i] for i in audit_idx]
     pairs = sorted(
-        [(sim_audit[i, j], uniq_paths[i].name, uniq_paths[j].name)
-         for i in range(n_uniq) for j in range(i + 1, n_uniq)],
+        [(sim_audit[i, j], audit_paths[i].name, audit_paths[j].name)
+         for i in range(audit_n) for j in range(i + 1, audit_n)],
         reverse=True,
     )[:5]
-    print("\nTop 5 most similar pairs (fused space):")
+    print("\nTop 5 most similar pairs (fused space, sampled):")
     for s, a, b in pairs:
         print(f"  {s:.3f}  {a} ↔ {b}")
 
-    # ── Build and return cluster data (mirrors getans toreturn) 
+    # ── Build and return cluster data ──────────────────────────
     toreturn = {}
     cluster_groups = {}
     for i, path in enumerate(valid_paths):
@@ -439,6 +518,7 @@ if __name__ == "__main__":
         noise_assignment           = "none",
         clip_weight                = 0.5,
         blip_weight                = 0.5,
+        batch_size                 = 8,     # lower to 4 if you get OOM errors
     )
 
     # Preview output

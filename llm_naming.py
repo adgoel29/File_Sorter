@@ -8,8 +8,9 @@ import json
 import re
 
 chat= ChatOllama(
-    model="gemma3:1b",
-    temperature=0
+    model="qwen3.5:2b",
+    temperature=0,
+    reasoning=False
 )
 
 
